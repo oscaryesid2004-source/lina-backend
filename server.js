@@ -1,5 +1,4 @@
-// server.js — LINA Backend (Express + CORS + OpenAI/Gemini)
-// Listo para Render. Puerto automático (PORT) o 10000.
+// server.js — LINA Backend (Express + CORS ABIERTO + OpenAI/Gemini)
 
 import express from 'express';
 import cors from 'cors';
@@ -8,24 +7,9 @@ import fetch from 'node-fetch';
 
 const app = express();
 
-// ===== CORS (permitir desde tu sitio) =====
-const allowedOrigins = [
-  'https://lina.sinacol.com.co',
-  'https://sinacol.com.co'
-];
-
-app.use(cors({
-  origin: (origin, cb) => {
-    // Permite peticiones sin origin (curl/Postman) o desde tus dominios
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(null, false);
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-// Preflight para todas las rutas
-app.options('*', cors());
+// ===== CORS ABIERTO (temporal para probar) =====
+app.use(cors());              // permite cualquier origen
+app.options('*', cors());     // responde a preflight OPTIONS
 
 // ===== Body parser =====
 app.use(express.json({ limit: '1mb' }));
@@ -33,7 +17,7 @@ app.use(express.json({ limit: '1mb' }));
 // ===== Healthcheck =====
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ===== Configuración de modelos =====
+// ===== Config =====
 const PROVIDER = (process.env.PROVIDER || 'openai').toLowerCase(); // 'openai' | 'gemini'
 const MODEL = process.env.MODEL || (PROVIDER === 'gemini' ? 'gemini-1.5-flash' : 'gpt-4o-mini');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -41,28 +25,28 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const SYSTEM_BY_THEME = {
   general: "Eres LINA, una IA amable y clara para personas. Responde en pasos simples (máx 6), sin jerga técnica.",
-  cocina: "LINA modo Cocina. Chef latino práctico: 1-4 porciones, pasos simples, tiempos y lista de compra. Ingredientes locales y económicos.",
-  finanzas: "LINA modo Finanzas. Presupuesto, ahorro y deudas con números simples y ejemplos. Aclara que no es consejo profesional.",
-  emprendimiento: "LINA modo Emprender. Guía ventas por WhatsApp, cliente ideal, oferta y precios, con ejemplos.",
-  'formacion-digital': "LINA modo Digital. Enseña a usar celular/apps paso a paso (Paso 1, Paso 2…), sin tecnicismos.",
+  cocina: "LINA modo Cocina. Chef latino práctico: 1-4 porciones, pasos simples, tiempos y lista de compra.",
+  finanzas: "LINA modo Finanzas. Presupuesto, ahorro y deudas con números simples (no consejo profesional).",
+  emprendimiento: "LINA modo Emprender. Guía ventas por WhatsApp, cliente ideal y precios.",
+  'formacion-digital': "LINA modo Digital. Enseña a usar celular/apps paso a paso (Paso 1, Paso 2…).",
   hogar: "LINA modo Hogar. Limpieza y organización casera. Evita mezclas peligrosas.",
   mascotas: "LINA modo Mascotas. Consejos básicos; ante urgencias, veterinario.",
-  salud: "LINA modo Salud. Hábitos saludables y autocuidado; no es consejo médico.",
+  salud: "LINA modo Salud. Hábitos saludables; no es consejo médico.",
   'salud-mental': "LINA modo Salud Mental. Apoyo básico; no reemplaza terapia.",
-  familia: "LINA modo Familia. Comunicación asertiva y acuerdos simples.",
-  aprendizaje: "LINA modo Estudio. Explica con ejemplos, paso a paso.",
-  idiomas: "LINA modo Idiomas. Frases útiles y práctica corta; corrige suave.",
-  empleo: "LINA modo Empleo. CV, entrevistas y habilidades.",
-  mecanica: "LINA modo Mecánica. Mantenimiento básico seguro; advierte riesgos.",
+  familia: "LINA modo Familia. Comunicación asertiva.",
+  aprendizaje: "LINA modo Estudio. Explica con ejemplos.",
+  idiomas: "LINA modo Idiomas. Frases útiles.",
+  empleo: "LINA modo Empleo. CV e entrevistas.",
+  mecanica: "LINA modo Mecánica. Mantenimiento básico seguro.",
   construccion: "LINA modo Construcción. Reparaciones caseras con seguridad.",
-  agricultura: "LINA modo Agricultura. Huerta, abonos y cuidados según clima.",
+  agricultura: "LINA modo Agricultura. Huerta y abonos.",
   'ia-herramientas': "LINA modo IA. Enseña herramientas con casos reales.",
   comunicacion: "LINA modo Comunicación. Mejora textos y presentaciones.",
-  creatividad: "LINA modo Creatividad. Ideas simples y pasos cortos.",
-  cultura: "LINA modo Cultura. Historia y contexto local, ameno.",
-  espiritualidad: "LINA modo Espiritualidad. Hábitos y reflexiones positivas, con respeto.",
-  viajes: "LINA modo Viajes. Rutas, presupuestos y seguridad.",
-  tramites: "LINA modo Trámites. Pasos claros y documentos típicos; pueden variar por ciudad/país."
+  creatividad: "LINA modo Creatividad. Ideas y pasos cortos.",
+  cultura: "LINA modo Cultura. Historia amena.",
+  espiritualidad: "LINA modo Espiritualidad. Hábitos y reflexiones positivas.",
+  viajes: "LINA modo Viajes. Rutas y presupuestos.",
+  tramites: "LINA modo Trámites. Pasos y documentos típicos."
 };
 
 // ===== Llamadas a modelos =====
@@ -73,11 +57,7 @@ async function callOpenAI(messages) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${OPENAI_API_KEY}`
     },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      temperature: 0.3
-    })
+    body: JSON.stringify({ model: MODEL, messages, temperature: 0.3 })
   });
   const data = await resp.json();
   return data?.choices?.[0]?.message?.content?.trim() || '';
@@ -99,7 +79,7 @@ async function callGemini(messages) {
 // ===== Endpoint principal =====
 app.post('/api/ask', async (req, res) => {
   try {
-    const { theme = 'general', message = '', history = [] } = req.body || {};
+    const { theme = 'general', message = '' } = req.body || {};
     const system = SYSTEM_BY_THEME[theme] || SYSTEM_BY_THEME.general;
     const messages = [{ role: 'system', content: system }, { role: 'user', content: message }];
 
@@ -121,6 +101,5 @@ app.post('/api/ask', async (req, res) => {
 
 // ===== Arranque =====
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log('LINA backend corriendo en', PORT);
-});
+app.listen(PORT, () => console.log('LINA backend corriendo en', PORT));
+
