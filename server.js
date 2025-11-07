@@ -1,5 +1,6 @@
-// server.js  — LINA backend (Express + OpenAI GPT-4o-mini)
-// Requiere: "type": "module" en package.json y dependencia "openai" v4+
+// server.js — LINA backend (Express + OpenAI)
+// Requiere "openai" v4+, "express", "cors", "express-rate-limit"
+// y Node 18+ (Render lo soporta). Usa variables de entorno.
 
 import express from "express";
 import cors from "cors";
@@ -13,7 +14,6 @@ const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 
-// Validaciones básicas de entorno
 if (!OPENAI_API_KEY) {
   console.error("Falta OPENAI_API_KEY en variables de entorno.");
   process.exit(1);
@@ -25,12 +25,12 @@ const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Rate limit (protege tu backend público)
+// Límite suave para proteger el backend público
 app.use(
   "/api/",
   rateLimit({
     windowMs: 60 * 1000, // 1 minuto
-    max: 60,             // 60 requests/min por IP
+    max: 60,             // 60 req/min por IP
     standardHeaders: true,
     legacyHeaders: false,
   })
@@ -43,45 +43,44 @@ app.get("/health", (_req, res) => {
 
 // ---------- Utilidades ----------
 function buildSystemPrompt(topic = "general") {
-  // Ajusta el “modo” de LINA según el tema
-  // Puedes crear textos más específicos por categoría
   const map = {
     cocina:
       "Eres LINA en modo cocina. Responde en español, con recetas simples, pasos cortos y tips prácticos. Sé clara y amable.",
     finanzas:
-      "Eres LINA en modo finanzas personales. Responde en español, simple y responsable, sin reemplazar asesoría profesional.",
+      "Eres LINA en modo finanzas personales. Responde en español, simple y responsable. No es asesoría profesional.",
     estudio:
       "Eres LINA en modo estudio. Explica paso a paso, con ejemplos sencillos y resúmenes claros.",
     default:
       "Eres LINA, una asistente útil, concreta y amable. Responde en español de forma práctica y fácil.",
   };
-  return map[topic?.toLowerCase()] || map.default;
+  return map[(topic || "").toLowerCase()] || map.default;
 }
 
 function normalizeUserText(txt) {
-  return String(txt || "").slice(0, 4000); // Evita textos gigantes
+  return String(txt || "").slice(0, 4000);
 }
 
 // ---------- Endpoint principal ----------
 app.post("/api/ask", async (req, res) => {
   try {
-    const { message, topic } = req.body || {};
-    const user = normalizeUserText(message);
-    if (!user) {
-      return res.status(400).json({ ok: false, reply: "Escribe algo para empezar. 😊" });
+    // Acepta 'topic' o 'tema' (por compatibilidad con tu front actual)
+    const { message, topic, tema } = req.body || {};
+    const userText = normalizeUserText(message);
+    if (!userText) {
+      return res.status(400).json({ reply: "Escribe algo para empezar. 😊" });
     }
 
-    const systemPrompt = buildSystemPrompt(topic);
+    const theTopic = topic || tema || "general";
+    const systemPrompt = buildSystemPrompt(theTopic);
 
     const completion = await client.chat.completions.create({
       model: MODEL,
-      temperature: 0.7,
-      max_tokens: 600, // ajusta si quieres respuestas más largas/cortas
+      temperature: 0.6,
+      max_tokens: 600,
       messages: [
         { role: "system", content: systemPrompt },
-        // *Opcional*: añade reglas de estilo globales:
         { role: "system", content: "Sé breve, clara y orientada a la acción." },
-        { role: "user", content: user },
+        { role: "user", content: userText },
       ],
     });
 
@@ -89,35 +88,27 @@ app.post("/api/ask", async (req, res) => {
       completion?.choices?.[0]?.message?.content?.trim() ||
       "No pude generar una respuesta en este momento.";
 
-    // Devuelve SIEMPRE un objeto simple al front
-    return res.json({ ok: true, reply: text });
+    return res.json({ reply: text });
   } catch (err) {
-    // Manejo de errores amistoso
     const status = err?.status ?? 500;
 
-    // Casos comunes
     if (status === 429) {
-      // Límite o crédito insuficiente
       return res.status(429).json({
-        ok: false,
         reply:
-          "Estoy procesando muchas solicitudes o tu crédito se agotó. Intenta de nuevo en un momento. Si persiste, revisa el saldo de la API.",
+          "Hay muchas solicitudes o tu saldo de API se agotó. Intenta de nuevo o revisa tu crédito en OpenAI.",
       });
     }
 
     if (status === 401 || status === 403) {
       return res.status(status).json({
-        ok: false,
         reply:
-          "No tengo permiso para acceder al modelo. Verifica tu API Key y permisos del proyecto.",
+          "Clave inválida o sin permiso. Verifica tu OPENAI_API_KEY y los permisos del proyecto.",
       });
     }
 
     console.error("Error /api/ask:", err?.response?.data || err?.message || err);
     return res.status(500).json({
-      ok: false,
-      reply:
-        "Hubo un problema al generar la respuesta. Intenta de nuevo en un momento.",
+      reply: "Tuvimos un problema al responder. Intenta nuevamente en un momento.",
     });
   }
 });
