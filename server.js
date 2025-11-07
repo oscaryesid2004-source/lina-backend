@@ -1,107 +1,128 @@
-// server.js — LINA Backend (OpenAI/Gemini) con fallback y sin mostrar errores al usuario
-import express from 'express';
-import cors from 'cors';
-import 'dotenv/config';
-import fetch from 'node-fetch';
+// server.js  — LINA backend (Express + OpenAI GPT-4o-mini)
+// Requiere: "type": "module" en package.json y dependencia "openai" v4+
+
+import express from "express";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import OpenAI from "openai";
 
 const app = express();
 
+// ---------- Config ----------
+const PORT = process.env.PORT || 10000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const MODEL = process.env.MODEL || "gpt-4o-mini";
+
+// Validaciones básicas de entorno
+if (!OPENAI_API_KEY) {
+  console.error("Falta OPENAI_API_KEY en variables de entorno.");
+  process.exit(1);
+}
+
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// ---------- Middlewares ----------
 app.use(cors());
-app.options('*', cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: "1mb" }));
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+// Rate limit (protege tu backend público)
+app.use(
+  "/api/",
+  rateLimit({
+    windowMs: 60 * 1000, // 1 minuto
+    max: 60,             // 60 requests/min por IP
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-const PROVIDER = (process.env.PROVIDER || 'openai').toLowerCase();
-const MODEL = process.env.MODEL || (PROVIDER === 'gemini' ? 'gemini-1.5-flash' : 'gpt-4o-mini');
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+// ---------- Health ----------
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, model: MODEL });
+});
 
-const SYSTEM_BY_THEME = {
-  general:
-    'Eres LINA, una IA amable y clara para personas. Responde paso a paso (máx 6), sin jerga técnica.',
-  cocina:
-    'LINA modo Cocina. Chef latino práctico: 1-4 porciones, pasos simples, tiempos y lista de compra.',
-  finanzas:
-    'LINA modo Finanzas. Presupuesto, ahorro y deudas con números simples (no es consejo profesional).',
-  emprendimiento:
-    'LINA modo Emprender. Guía ventas por WhatsApp, cliente ideal y precios.'
-};
-
-function localFallback(theme, message) {
-  if ((theme || '').toLowerCase() === 'cocina') {
-    const ing = message?.trim() || 'ingredientes sencillos';
-    return `Idea rápida con lo que tienes:
-- ${ing}
-- Sofríe 5 min, agrega sal y una pizca de pimienta.
-- Sirve con arroz/pan.
-TIP: añade huevo o atún para proteína.`;
-  }
-  return `Estoy listo para ayudarte. Escribe tu duda y te respondo paso a paso.`;
+// ---------- Utilidades ----------
+function buildSystemPrompt(topic = "general") {
+  // Ajusta el “modo” de LINA según el tema
+  // Puedes crear textos más específicos por categoría
+  const map = {
+    cocina:
+      "Eres LINA en modo cocina. Responde en español, con recetas simples, pasos cortos y tips prácticos. Sé clara y amable.",
+    finanzas:
+      "Eres LINA en modo finanzas personales. Responde en español, simple y responsable, sin reemplazar asesoría profesional.",
+    estudio:
+      "Eres LINA en modo estudio. Explica paso a paso, con ejemplos sencillos y resúmenes claros.",
+    default:
+      "Eres LINA, una asistente útil, concreta y amable. Responde en español de forma práctica y fácil.",
+  };
+  return map[topic?.toLowerCase()] || map.default;
 }
 
-async function callOpenAI(messages) {
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({ model: MODEL, messages, temperature: 0.3 })
-  });
-  const text = await resp.text();
-  if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${text}`);
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`OpenAI parse error: ${text}`); }
-  const reply = data?.choices?.[0]?.message?.content?.trim();
-  if (!reply) throw new Error(`OpenAI vacío: ${text}`);
-  return reply;
+function normalizeUserText(txt) {
+  return String(txt || "").slice(0, 4000); // Evita textos gigantes
 }
 
-async function callGemini(messages) {
-  const sys = messages.find(m => m.role === 'system')?.content || '';
-  const user = messages.filter(m => m.role === 'user').map(m => m.content).join('\n\n');
-  const prompt = `INSTRUCCIONES:\n${sys}\n\nMENSAJE DEL USUARIO:\n${user}`;
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
-  const text = await resp.text();
-  if (!resp.ok) throw new Error(`Gemini ${resp.status}: ${text}`);
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`Gemini parse error: ${text}`); }
-  const reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
-  if (!reply) throw new Error(`Gemini vacío: ${text}`);
-  return reply;
-}
-
-app.post('/api/ask', async (req, res) => {
-  const { theme = 'general', message = '' } = req.body || {};
-  const system = SYSTEM_BY_THEME[theme] || SYSTEM_BY_THEME.general;
-  const messages = [
-    { role: 'system', content: system },
-    { role: 'user', content: message }
-  ];
-
+// ---------- Endpoint principal ----------
+app.post("/api/ask", async (req, res) => {
   try {
-    let reply = '';
-    if (PROVIDER === 'gemini') {
-      if (!GEMINI_API_KEY) throw new Error('Falta GEMINI_API_KEY');
-      reply = await callGemini(messages);
-    } else {
-      if (!OPENAI_API_KEY) throw new Error('Falta OPENAI_API_KEY');
-      reply = await callOpenAI(messages);
+    const { message, topic } = req.body || {};
+    const user = normalizeUserText(message);
+    if (!user) {
+      return res.status(400).json({ ok: false, reply: "Escribe algo para empezar. 😊" });
     }
-    return res.json({ reply });
+
+    const systemPrompt = buildSystemPrompt(topic);
+
+    const completion = await client.chat.completions.create({
+      model: MODEL,
+      temperature: 0.7,
+      max_tokens: 600, // ajusta si quieres respuestas más largas/cortas
+      messages: [
+        { role: "system", content: systemPrompt },
+        // *Opcional*: añade reglas de estilo globales:
+        { role: "system", content: "Sé breve, clara y orientada a la acción." },
+        { role: "user", content: user },
+      ],
+    });
+
+    const text =
+      completion?.choices?.[0]?.message?.content?.trim() ||
+      "No pude generar una respuesta en este momento.";
+
+    // Devuelve SIEMPRE un objeto simple al front
+    return res.json({ ok: true, reply: text });
   } catch (err) {
-    console.error('API error:', err?.message || err);
-    const reply = localFallback(theme, message);
-    return res.status(200).json({ reply, meta: { fallback: true } });
+    // Manejo de errores amistoso
+    const status = err?.status ?? 500;
+
+    // Casos comunes
+    if (status === 429) {
+      // Límite o crédito insuficiente
+      return res.status(429).json({
+        ok: false,
+        reply:
+          "Estoy procesando muchas solicitudes o tu crédito se agotó. Intenta de nuevo en un momento. Si persiste, revisa el saldo de la API.",
+      });
+    }
+
+    if (status === 401 || status === 403) {
+      return res.status(status).json({
+        ok: false,
+        reply:
+          "No tengo permiso para acceder al modelo. Verifica tu API Key y permisos del proyecto.",
+      });
+    }
+
+    console.error("Error /api/ask:", err?.response?.data || err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      reply:
+        "Hubo un problema al generar la respuesta. Intenta de nuevo en un momento.",
+    });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log('LINA backend corriendo en', PORT));
+// ---------- Arranque ----------
+app.listen(PORT, () => {
+  console.log(`LINA backend corriendo en puerto ${PORT}`);
+});
