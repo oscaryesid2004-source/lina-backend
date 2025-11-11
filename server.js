@@ -1,207 +1,194 @@
-// server.js — LINA backend (Express + OpenAI + Trials + Bold sandbox proxy)
-import express from "express";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
-import OpenAI from "openai";
-import jwt from "jsonwebtoken";
-import fetch from "node-fetch";
+// server.js — LINA backend (Express + OpenAI) con auth de prueba y cuota
+import express from 'express';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
+import OpenAI from 'openai';
 
 const app = express();
 
-// ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = process.env.MODEL || "gpt-4o-mini";
-const TRIAL_SECRET = process.env.TRIAL_SECRET || "change_me";
-const TRIAL_FREE_COUNT = parseInt(process.env.TRIAL_FREE_COUNT || "5", 10);
+const MODEL = process.env.MODEL || 'gpt-4o-mini';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-please-change';
+const ORIGIN = process.env.ORIGIN || '*';
 
-const BOLD_API_KEY = process.env.BOLD_API_KEY || "";
-const BOLD_BASE_URL = process.env.BOLD_BASE_URL || "https://integrations.api.bold.co";
-
-// Validaciones básicas
 if (!OPENAI_API_KEY) {
-  console.error("Falta OPENAI_API_KEY");
+  console.error('Falta OPENAI_API_KEY');
   process.exit(1);
 }
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 120,
-    standardHeaders: true,
-    legacyHeaders: false,
-  })
-);
+// ======= CORS / Middlewares
+app.use(cors({
+  origin: ORIGIN === '*' ? true : ORIGIN,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  maxAge: 86400
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use('/api/', rateLimit({ windowMs: 60_000, max: 60 }));
 
-// ---------- Utils JWT ----------
-function signTrialToken(payload) {
-  // payload: { uid, email, remaining, plan }
-  return jwt.sign(payload, TRIAL_SECRET, { expiresIn: "30d" });
+// ======= Health
+app.get('/health', (_req, res) => res.json({ ok: true, model: MODEL }));
+
+// ======= “DB” en memoria (DEMO)
+const users = new Map(); // email -> { email, paid, quota, used, updatedAt }
+
+// Helpers
+function now() { return new Date().toISOString(); }
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '15d' });
 }
 function verifyToken(token) {
-  try { return jwt.verify(token, TRIAL_SECRET); }
-  catch { return null; }
+  return jwt.verify(token, JWT_SECRET);
 }
+function normalizeEmail(e){ return String(e||'').trim().toLowerCase(); }
 
-// ---------- Health ----------
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, model: MODEL });
-});
-
-// ---------- Registro (trial) ----------
-app.post("/api/register", (req, res) => {
-  const { email } = req.body || {};
-  const clean = String(email || "").trim().toLowerCase();
-  if (!clean || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean)) {
-    return res.status(400).json({ ok: false, error: "EMAIL_INVALID" });
+// ======= Auth endpoints
+// Registro de prueba (5 preguntas)
+app.post('/api/auth/register-trial', (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ message:'Email inválido' });
   }
-  const uid = "u_" + Buffer.from(clean).toString("hex").slice(0, 16);
-  const token = signTrialToken({
-    uid,
-    email: clean,
-    remaining: TRIAL_FREE_COUNT,
-    plan: "trial",
+
+  let u = users.get(email);
+  if (!u) {
+    u = { email, paid:false, quota:5, used:0, updatedAt: now() };
+    users.set(email, u);
+  }
+  // Si ya usó el trial por completo y no ha pagado, igual devolvemos token
+  // para que el front pueda mostrar “trial agotado”
+  const token = signToken({ email: u.email, paid: u.paid, quota: u.quota, used: u.used });
+
+  return res.json({
+    email: u.email,
+    paid: u.paid,
+    quota: u.quota,
+    used: u.used,
+    remaining: Math.max(0, u.quota - u.used),
+    token
   });
-  return res.json({ ok: true, token, remaining: TRIAL_FREE_COUNT, plan: "trial" });
 });
 
-// ---------- Estado trial ----------
-app.get("/api/trial-status", (req, res) => {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const data = verifyToken(token);
-  if (!data) return res.status(401).json({ ok: false, error: "TOKEN_INVALID" });
-  return res.json({ ok: true, remaining: data.remaining ?? 0, plan: data.plan || "trial" });
+// Login “simple”: reemite token y estado
+app.post('/api/auth/login', (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ message:'Email inválido' });
+  }
+  let u = users.get(email);
+  if (!u) {
+    // Si jamás se registró, crea registro trial sin consumir
+    u = { email, paid:false, quota:5, used:0, updatedAt: now() };
+    users.set(email, u);
+  }
+  const token = signToken({ email: u.email, paid: u.paid, quota: u.quota, used: u.used });
+  return res.json({
+    email: u.email,
+    paid: u.paid,
+    quota: u.quota,
+    used: u.used,
+    remaining: Math.max(0, u.quota - u.used),
+    token
+  });
 });
 
-// ---------- Middleware trial para /api/ask ----------
-function requireTrialOrPaid(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const data = verifyToken(token);
-  if (!data) return res.status(401).json({ ok: false, error: "TOKEN_INVALID" });
-  req.user = data;
-  next();
+// Middleware auth
+function requireAuth(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  if (!token) return res.status(401).json({ message:'Falta token' });
+  try {
+    const payload = verifyToken(token);
+    req.user = payload;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ message:'Token inválido' });
+  }
 }
 
-// ---------- Endpoint principal ----------
-app.post("/api/ask", requireTrialOrPaid, async (req, res) => {
+// Estado actual
+app.get('/api/me', requireAuth, (req,res)=>{
+  const email = req.user.email;
+  const u = users.get(email);
+  if (!u) return res.status(404).json({ message:'No existe' });
+  return res.json({
+    email: u.email,
+    paid: u.paid,
+    quota: u.quota,
+    used: u.used,
+    remaining: Math.max(0, u.quota - u.used)
+  });
+});
+
+// ======= Utilidad de prompt
+function buildSystemPrompt(topic = 'general') {
+  return "Eres LINA, una asistente útil, concreta y amable. Responde en español de forma práctica y fácil.";
+}
+
+// ======= /api/ask con consumo de cuota
+app.post('/api/ask', requireAuth, async (req, res) => {
   try {
-    let { message, topic } = req.body || {};
-    const user = req.user; // {uid,email,remaining,plan}
+    const email = req.user.email;
+    const u = users.get(email);
+    if (!u) return res.status(401).json({ message:'Sesión inválida' });
 
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ ok: false, reply: "Escribe algo para empezar. 😊" });
+    const message = String(req.body?.message || '').trim();
+    const topic = String(req.body?.theme || 'general');
+    if (!message) return res.status(400).json({ message:'Debes enviar "message"' });
+
+    // Control de cuota (si no es pago)
+    if (!u.paid && u.used >= u.quota) {
+      return res.status(402).json({
+        ok:false,
+        code:'trial_exhausted',
+        message:'Has usado tus 5 preguntas gratis. Suscríbete para continuar.'
+      });
     }
-
-    // Control de trial
-    if (user.plan === "trial") {
-      if (!Number.isFinite(user.remaining) || user.remaining <= 0) {
-        return res.status(402).json({
-          ok: false,
-          reply: "Se agotaron tus 5 preguntas gratis. Suscríbete para seguir usando LINA.",
-        });
-      }
-      user.remaining -= 1;
-    }
-
-    // Prompt por tema (opcional: dejamos general)
-    const systemPrompt =
-      "Eres LINA, una asistente clara y amable. Responde en español, breve y orientada a la acción.";
 
     const completion = await client.chat.completions.create({
       model: MODEL,
       temperature: 0.7,
       max_tokens: 600,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "system", content: "Sé breve, clara y concreta." },
-        { role: "user", content: String(message).slice(0, 4000) },
-      ],
+        { role:'system', content: buildSystemPrompt(topic) },
+        { role:'system', content: 'Sé breve, clara y orientada a la acción.' },
+        { role:'user', content: message },
+      ]
     });
 
-    const text =
-      completion?.choices?.[0]?.message?.content?.trim() ||
-      "No pude generar una respuesta en este momento.";
+    const text = completion?.choices?.[0]?.message?.content?.trim()
+      || 'No pude generar una respuesta en este momento.';
 
-    // Si es trial, devolvemos token actualizado con remaining
-    let headers = {};
-    if (user.plan === "trial") {
-      const newToken = signTrialToken({
-        uid: user.uid, email: user.email,
-        remaining: user.remaining, plan: "trial",
-      });
-      headers["x-refresh-token"] = newToken;
+    // Consumir 1 uso si no es pago
+    if (!u.paid) {
+      u.used += 1;
+      u.updatedAt = now();
     }
+    // Re-emite token con estado actualizado
+    const token = signToken({ email:u.email, paid:u.paid, quota:u.quota, used:u.used });
 
-    return res.set(headers).json({ ok: true, reply: text });
+    return res.json({
+      ok:true,
+      reply:text,
+      remaining: Math.max(0, u.quota - u.used),
+      token
+    });
   } catch (err) {
     const status = err?.status ?? 500;
     if (status === 429) {
-      return res.status(429).json({
-        ok: false,
-        reply: "Estoy procesando muchas solicitudes o tu crédito se agotó. Intenta de nuevo.",
-      });
+      return res.status(429).json({ ok:false, message:'Límite de modelo o crédito agotado. Intenta luego.' });
     }
-    if (status === 401 || status === 403) {
-      return res.status(status).json({ ok: false, reply: "No tengo permiso para acceder al modelo." });
-    }
-    console.error("Error /api/ask:", err?.response?.data || err?.message || err);
-    return res.status(500).json({ ok: false, reply: "Hubo un problema. Intenta más tarde." });
+    console.error('Error /api/ask:', err?.response?.data || err?.message || err);
+    return res.status(500).json({ ok:false, message:'Error generando respuesta.' });
   }
 });
 
-// ---------- BOLD Sandbox Proxies ----------
-function boldHeaders() {
-  return { Authorization: `x-api-key ${BOLD_API_KEY}`, "Content-Type": "application/json" };
-}
-
-// Métodos de pago
-app.get("/api/bold/payment-methods", async (_req, res) => {
-  try {
-    const r = await fetch(`${BOLD_BASE_URL}/payments/payment-methods`, {
-      headers: boldHeaders(),
-    });
-    const j = await r.json();
-    return res.status(r.status).json(j);
-  } catch (e) {
-    return res.status(500).json({ payload: null, errors: ["BOLD_PROXY_ERROR"] });
-  }
-});
-
-// Terminales disponibles
-app.get("/api/bold/binded-terminals", async (_req, res) => {
-  try {
-    const r = await fetch(`${BOLD_BASE_URL}/payments/binded-terminals`, {
-      headers: boldHeaders(),
-    });
-    const j = await r.json();
-    return res.status(r.status).json(j);
-  } catch (e) {
-    return res.status(500).json({ payload: null, errors: ["BOLD_PROXY_ERROR"] });
-  }
-});
-
-// Crear pago (sandbox)
-app.post("/api/bold/app-checkout", async (req, res) => {
-  try {
-    const r = await fetch(`${BOLD_BASE_URL}/payments/app-checkout`, {
-      method: "POST",
-      headers: boldHeaders(),
-      body: JSON.stringify(req.body || {}),
-    });
-    const j = await r.json();
-    return res.status(r.status).json(j);
-  } catch (e) {
-    return res.status(500).json({ payload: null, errors: ["BOLD_PROXY_ERROR"] });
-  }
-});
-
-// ---------- Arranque ----------
+// ======= Arranque
 app.listen(PORT, () => {
   console.log(`LINA backend corriendo en puerto ${PORT}`);
 });
+
