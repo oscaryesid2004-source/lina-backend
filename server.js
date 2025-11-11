@@ -22,29 +22,30 @@ const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 app.set("trust proxy", 1);
 
-// ---------- Middlewares (CORS + preflight + cabeceras útiles) ----------
-app.use(
-  cors({
-    origin: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
+// ---------- CORS robusto + preflight (móvil) ----------
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+  maxAge: 86400
+}));
 app.options("*", cors());
 
+// ---------- Body parser ----------
 app.use(express.json({ limit: "1mb" }));
 
+// ---------- Cabeceras útiles ----------
 app.use((req, res, next) => {
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   next();
 });
 
-// Rate limit (protege tu backend público)
-app.use(
-  "/api/",
+// ---------- Rate limit (protege backend público) ----------
+app.use("/api/",
   rateLimit({
-    windowMs: 60 * 1000, // 1 minuto
+    windowMs: 60 * 1000, // 1 min
     max: 60,             // 60 req/min por IP
     standardHeaders: true,
     legacyHeaders: false,
@@ -66,11 +67,21 @@ function buildSystemPrompt(topic = "general") {
     estudio:
       "Eres LINA en modo estudio. Explica paso a paso, con ejemplos sencillos y resúmenes claros.",
     hogar:
-      "Eres LINA en modo hogar. Da instrucciones sencillas para limpiar, organizar, cocinar y mantener la casa.",
+      "Eres LINA en modo hogar. Da instrucciones sencillas para limpiar, organizar y mantener la casa.",
     salud:
       "Eres LINA en modo salud general. Ofrece consejos de autocuidado y hábitos saludables. No das diagnóstico médico.",
     emprendimiento:
       "Eres LINA en modo emprender. Ayudas a definir oferta, público, precios, ventas por WhatsApp y contenidos.",
+    trabajo:
+      "Eres LINA en modo trabajo. CV, entrevistas, liderazgo y productividad.",
+    tecnologia:
+      "Eres LINA en modo tecnología. IA, apps y herramientas útiles.",
+    idiomas:
+      "Eres LINA en modo idiomas. Practiquemos vocabulario y conversación sencilla.",
+    viajes:
+      "Eres LINA en modo viajes. Rutas, presupuesto y tips prácticos.",
+    mascotas:
+      "Eres LINA en modo mascotas. Cuidado básico y entrenamiento amable.",
     default:
       "Eres LINA, una asistente útil, concreta y amable. Responde en español de forma práctica y orientada a la acción.",
   };
@@ -86,13 +97,11 @@ app.post("/api/ask", async (req, res) => {
   try {
     const body = req.body || {};
     const message = normalizeUserText(body.message);
-    // aceptamos 'topic' o 'theme'
+    // acepta 'topic' o 'theme'
     const topic = body.topic || body.theme || "general";
 
     if (!message) {
-      return res
-        .status(400)
-        .json({ ok: false, reply: "Escribe algo para empezar. 😊" });
+      return res.status(400).json({ ok: false, reply: "Escribe algo para empezar. 😊" });
     }
 
     const systemPrompt = buildSystemPrompt(topic);
@@ -135,8 +144,7 @@ app.post("/api/ask", async (req, res) => {
     console.error("Error /api/ask:", err?.response?.data || err?.message || err);
     return res.status(500).json({
       ok: false,
-      reply:
-        "Hubo un problema al generar la respuesta. Intenta de nuevo en un momento.",
+      reply: "Hubo un problema al generar la respuesta. Intenta de nuevo en un momento.",
     });
   }
 });
